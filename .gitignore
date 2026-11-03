@@ -1,0 +1,45 @@
+# Rust
+/target/
+**/target/
+
+# Site (site/)
+node_modules/
+.next/
+out/
+*.tsbuildinfo
+next-env.d.ts
+npm-debug.log*
+
+# Build output and binaries (releases go to GitHub Releases)
+/dist/
+*.exe
+*.dll
+*.pdb
+*.msi
+*.new
+*.old
+
+# Secrets and local config
+.env
+.env.*
+!.env.example
+*.pem
+deploykey*
+id_rsa*
+id_ed25519*
+config.local.toml
+.caprover/
+
+# Logs, temp
+*.log
+*.part
+*.tmp
+
+# IDE / OS
+.vs/
+.vscode/
+.idea/
+*.user
+.DS_Store
+Thumbs.db
+desktop.ini

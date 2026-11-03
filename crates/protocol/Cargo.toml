@@ -1,0 +1,12 @@
+[package]
+name = "inputshare-protocol"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "UDP mouse and keyboard input, plus TCP handshake, clipboard and file packets for INTmouse."
+
+[dependencies]
+serde = { workspace = true }
+bytes = { workspace = true }
+thiserror = { workspace = true }
+bincode = { workspace = true }
