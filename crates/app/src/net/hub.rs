@@ -930,14 +930,9 @@ async fn discovery_and_send_loop(shared: Arc<Shared>, udp: UdpSet) {
         .unwrap_or_else(Instant::now);
 
     loop {
-        // While steering another computer, pick up mouse batches within 1 ms. A 50 ms poll
-        // would flatten every rate from 125 Hz upward into 20 updates a second.
-        let wait = if shared.capture.capturing.load(Ordering::SeqCst) {
-            Duration::from_millis(1)
-        } else {
-            Duration::from_millis(50)
-        };
-        tokio::time::sleep(wait).await;
+        // Woken the moment the capture pushes a mouse batch (or an enter / leave), so each batch
+        // goes out at once; otherwise every 50 ms for discovery and the Enter timeouts.
+        shared.outbox.wait(Duration::from_millis(50)).await;
         let cfg = shared.cfg();
         if !cfg.sharing_enabled {
             continue;

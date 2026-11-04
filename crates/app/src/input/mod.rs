@@ -138,6 +138,9 @@ pub struct CaptureOutbox {
     /// Id of the remote display the pending enter goes to (for the way back).
     enter_tile: Arc<Mutex<Option<String>>>,
     leave: Arc<AtomicBool>,
+    /// Wakes the network loop the moment there is something to send. Sleeping instead made
+    /// motion wait for the Windows timer (often 15.6 ms), so the cursor there floated and lagged.
+    wake: Arc<tokio::sync::Notify>,
 }
 
 impl CaptureOutbox {
@@ -148,6 +151,12 @@ impl CaptureOutbox {
         if let Ok(mut g) = self.events.lock() {
             g.extend(batch);
         }
+        self.wake.notify_one();
+    }
+
+    /// Until something is pushed (events, enter, leave) or `at_most` has passed.
+    pub async fn wait(&self, at_most: std::time::Duration) {
+        let _ = tokio::time::timeout(at_most, self.wake.notified()).await;
     }
 
     pub fn take_events(&self) -> Vec<InputEvent> {
@@ -158,6 +167,7 @@ impl CaptureOutbox {
         if let Ok(mut g) = self.enter.lock() {
             *g = Some((host, edge, entry));
         }
+        self.wake.notify_one();
     }
 
     pub fn set_enter_tile(&self, tile_id: String) {
@@ -176,6 +186,7 @@ impl CaptureOutbox {
 
     pub fn signal_leave(&self) {
         self.leave.store(true, Ordering::SeqCst);
+        self.wake.notify_one();
     }
 
     pub fn take_leave(&self) -> bool {
@@ -1092,4 +1103,23 @@ mod tests {
         assert_eq!(b.take_events().len(), 1);
         assert!(a.take_events().is_empty());
     }
+
+    #[tokio::test]
+    async fn the_network_loop_wakes_at_once_when_motion_is_pushed() {
+        let outbox = CaptureOutbox::default();
+        let o2 = outbox.clone();
+        let started = Instant::now();
+        let waiter = tokio::spawn(async move { o2.wait(Duration::from_secs(5)).await });
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        outbox.push_events(vec![InputEvent::MouseMove { dx: 1, dy: 0 }]);
+        waiter.await.unwrap();
+        assert!(started.elapsed() < Duration::from_secs(1), "woken by the push, not the timeout");
+        assert_eq!(outbox.take_events().len(), 1);
+        // a push with nobody waiting is kept for the next wait
+        outbox.push_events(vec![InputEvent::MouseMove { dx: 2, dy: 0 }]);
+        let t = Instant::now();
+        outbox.wait(Duration::from_secs(5)).await;
+        assert!(t.elapsed() < Duration::from_millis(500));
+    }
 }
+

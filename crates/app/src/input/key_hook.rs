@@ -106,22 +106,53 @@ pub fn take_repeats(vk: u32) -> u32 {
     REPEATS[(vk as usize) & 0xFF].swap(0, Ordering::SeqCst).min(8)
 }
 
-/// Is this key (or mouse button, VK 1..6) held? Without the hook: `GetAsyncKeyState`.
+/// Is this key (or mouse button, VK 1..6) held? The hook's state, or the one Windows keeps: a
+/// key the hook kept from Windows shows only in the first, and one the hook never saw (Windows
+/// dropped the hook, or an administrator window has the focus) only in the second.
 pub fn key_down(vk: i32) -> bool {
     #[cfg(windows)]
     {
         let button = (0x01..=0x06).contains(&vk);
         let hooked = if button { MOUSE_HOOK_ON.load(Ordering::SeqCst) } else { HOOK_ON.load(Ordering::SeqCst) };
-        if hooked {
-            return held(vk);
-        }
-        use ::windows::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState;
-        unsafe { GetAsyncKeyState(vk) as u16 & 0x8000 != 0 }
+        (hooked && held(vk)) || async_down(vk)
     }
     #[cfg(not(windows))]
     {
         let _ = vk;
         false
+    }
+}
+
+#[cfg(windows)]
+fn async_down(vk: i32) -> bool {
+    use ::windows::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState;
+    unsafe { GetAsyncKeyState(vk) as u16 & 0x8000 != 0 }
+}
+
+/// Keys the watchdog compares (generic Shift/Ctrl/Alt are covered by their left/right codes).
+#[cfg(any(windows, test))]
+fn watched_keys() -> impl Iterator<Item = usize> {
+    (0x08..=0xFE).filter(|vk| !matches!(vk, 0x10 | 0x11 | 0x12))
+}
+
+#[cfg(any(windows, test))]
+const BUTTONS: [usize; 5] = [0x01, 0x02, 0x04, 0x05, 0x06];
+
+/// While nothing is being kept from Windows (not steering), the hook's state must match the one
+/// Windows keeps. A difference means the hook stopped getting events (Windows drops a low-level
+/// hook that once answered too slowly, without telling) or never got them.
+#[cfg(any(windows, test))]
+fn state_differs(vks: impl Iterator<Item = usize>, windows_down: impl Fn(usize) -> bool) -> bool {
+    vks.into_iter().any(|vk| HELD[vk].load(Ordering::SeqCst) != windows_down(vk))
+}
+
+/// Take the state Windows keeps as the hook's (after the hook is put in again).
+#[cfg(any(windows, test))]
+fn resync(vks: impl Iterator<Item = usize>, windows_down: impl Fn(usize) -> bool) {
+    for vk in vks {
+        let down = windows_down(vk);
+        HELD[vk].store(down, Ordering::SeqCst);
+        PASSED[vk].store(down, Ordering::SeqCst);
     }
 }
 
@@ -153,9 +184,10 @@ mod win {
     use super::*;
     use ::windows::Win32::Foundation::{HINSTANCE, LPARAM, LRESULT, WPARAM};
     use ::windows::Win32::System::LibraryLoader::GetModuleHandleW;
+    use ::windows::Win32::System::Threading::{GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_TIME_CRITICAL};
     use ::windows::Win32::UI::WindowsAndMessaging::{
-        CallNextHookEx, DispatchMessageW, GetMessageW, SetWindowsHookExW, TranslateMessage,
-        HC_ACTION, KBDLLHOOKSTRUCT, LLKHF_INJECTED, LLMHF_INJECTED, MSG, MSLLHOOKSTRUCT,
+        CallNextHookEx, DispatchMessageW, GetMessageW, SetTimer, SetWindowsHookExW, TranslateMessage,
+        UnhookWindowsHookEx, HC_ACTION, HHOOK, WM_TIMER, KBDLLHOOKSTRUCT, LLKHF_INJECTED, LLMHF_INJECTED, MSG, MSLLHOOKSTRUCT,
         WH_KEYBOARD_LL, WH_MOUSE_LL, WM_KEYDOWN, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN,
         WM_MBUTTONUP, WM_MOUSEHWHEEL, WM_MOUSEWHEEL, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SYSKEYDOWN,
         WM_XBUTTONDOWN, WM_XBUTTONUP,
@@ -164,13 +196,22 @@ mod win {
     use std::thread;
 
     static STEERING: OnceLock<Arc<AtomicBool>> = OnceLock::new();
+    /// When input injected by this program (the other computer steering this one) last went by:
+    /// the key state Windows keeps then includes keys the hook rightly ignores.
+    static LAST_INJECTED_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+    fn now_ms() -> u64 {
+        unsafe { ::windows::Win32::System::SystemInformation::GetTickCount64() }
+    }
 
     /// Counts the physical mouse's events and, while steering, keeps its clicks and wheel from
     /// this computer (they go to the other one). Movement always passes: the capture reads it.
     unsafe extern "system" fn mouse_hook(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
         if code == HC_ACTION as i32 {
             let ms = &*(lparam.0 as *const MSLLHOOKSTRUCT);
-            if ms.flags & LLMHF_INJECTED == 0 {
+            if ms.flags & LLMHF_INJECTED != 0 {
+                LAST_INJECTED_MS.store(now_ms(), Ordering::Relaxed);
+            } else {
                 PHYSICAL_MOUSE.fetch_add(1, Ordering::Relaxed);
                 let steering = STEERING.get().is_some_and(|s| s.load(Ordering::SeqCst));
                 let wheel = ((ms.mouseData >> 16) as u16) as i16 as i32;
@@ -199,7 +240,9 @@ mod win {
     unsafe extern "system" fn hook(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
         if code == HC_ACTION as i32 {
             let kb = &*(lparam.0 as *const KBDLLHOOKSTRUCT);
-            if kb.flags.0 & LLKHF_INJECTED.0 == 0 {
+            if kb.flags.0 & LLKHF_INJECTED.0 != 0 {
+                LAST_INJECTED_MS.store(now_ms(), Ordering::Relaxed);
+            } else {
                 let down = matches!(wparam.0 as u32, WM_KEYDOWN | WM_SYSKEYDOWN);
                 let steering = STEERING.get().is_some_and(|s| s.load(Ordering::SeqCst));
                 if on_key(kb.vkCode as usize, down, steering) {
@@ -217,21 +260,56 @@ mod win {
             return;
         }
         let _ = thread::Builder::new().name("inputshare-keys".into()).spawn(|| unsafe {
+            // A hook that answers late is dropped by Windows: this thread must never wait.
+            let _ = SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
             let module = GetModuleHandleW(None).ok();
             let module = module.map(HINSTANCE::from).unwrap_or_default();
-            let installed = SetWindowsHookExW(WH_KEYBOARD_LL, Some(hook), module, 0);
-            if installed.is_err() {
+            let mut keyboard: Option<HHOOK> = SetWindowsHookExW(WH_KEYBOARD_LL, Some(hook), module, 0).ok();
+            if keyboard.is_none() {
                 tracing::warn!("keyboard hook not installed: keys also reach this computer while steering");
-                return;
             }
-            HOOK_ON.store(true, Ordering::SeqCst);
-            if SetWindowsHookExW(WH_MOUSE_LL, Some(mouse_hook), module, 0).is_err() {
+            HOOK_ON.store(keyboard.is_some(), Ordering::SeqCst);
+            let mut mouse: Option<HHOOK> = SetWindowsHookExW(WH_MOUSE_LL, Some(mouse_hook), module, 0).ok();
+            if mouse.is_none() {
                 tracing::warn!("mouse hook not installed: no wheel while steering, and moving this computer's mouse will not take control back");
-            } else {
-                MOUSE_HOOK_ON.store(true, Ordering::SeqCst);
             }
+            MOUSE_HOOK_ON.store(mouse.is_some(), Ordering::SeqCst);
+            // Watchdog: every 500 ms compare with the key state Windows keeps; two differences
+            // in a row = put the hook in again.
+            let _ = SetTimer(None, 0, 500, None);
+            let (mut keys_off, mut buttons_off) = (0u8, 0u8);
+            let windows_down = |vk: usize| async_down(vk as i32);
             let mut msg = MSG::default();
             while GetMessageW(&mut msg, None, 0, 0).as_bool() {
+                if msg.message == WM_TIMER && msg.hwnd.0.is_null() {
+                    let steering = STEERING.get().is_some_and(|s| s.load(Ordering::SeqCst));
+                    let injected_lately = now_ms().saturating_sub(LAST_INJECTED_MS.load(Ordering::Relaxed)) < 2000;
+                    if !steering && !injected_lately {
+                        keys_off = if state_differs(watched_keys(), windows_down) { keys_off + 1 } else { 0 };
+                        buttons_off = if state_differs(BUTTONS.into_iter(), windows_down) { buttons_off + 1 } else { 0 };
+                        if keys_off >= 2 {
+                            keys_off = 0;
+                            if let Some(h) = keyboard.take() {
+                                let _ = UnhookWindowsHookEx(h);
+                            }
+                            keyboard = SetWindowsHookExW(WH_KEYBOARD_LL, Some(hook), module, 0).ok();
+                            HOOK_ON.store(keyboard.is_some(), Ordering::SeqCst);
+                            resync(watched_keys(), windows_down);
+                            tracing::debug!("keyboard hook put in again (it stopped getting keys)");
+                        }
+                        if buttons_off >= 2 {
+                            buttons_off = 0;
+                            if let Some(h) = mouse.take() {
+                                let _ = UnhookWindowsHookEx(h);
+                            }
+                            mouse = SetWindowsHookExW(WH_MOUSE_LL, Some(mouse_hook), module, 0).ok();
+                            MOUSE_HOOK_ON.store(mouse.is_some(), Ordering::SeqCst);
+                            resync(BUTTONS.into_iter(), windows_down);
+                            tracing::debug!("mouse hook put in again (it stopped getting clicks)");
+                        }
+                    }
+                    continue;
+                }
                 let _ = TranslateMessage(&msg);
                 DispatchMessageW(&msg);
             }
@@ -298,5 +376,19 @@ mod tests {
         let (h, v) = take_wheel();
         assert_eq!((h, v), (-2.0, 1.5));
         assert_eq!(take_wheel(), (0.0, 0.0));
+    }
+
+    #[test]
+    fn a_hook_that_missed_keys_is_noticed_and_takes_the_windows_state_over() {
+        // the hook saw nothing of a key Windows has down (dropped hook, admin window in front)
+        let vks = || [0x50usize, 0x51].into_iter();
+        resync(vks(), |_| false);
+        assert!(!state_differs(vks(), |_| false));
+        assert!(state_differs(vks(), |vk| vk == 0x51));
+        resync(vks(), |vk| vk == 0x51);
+        assert!(HELD[0x51].load(Ordering::SeqCst), "taken over from Windows");
+        assert!(!state_differs(vks(), |vk| vk == 0x51));
+        resync(vks(), |_| false);
+        assert!(watched_keys().all(|vk| !matches!(vk, 0x10 | 0x11 | 0x12)));
     }
 }
